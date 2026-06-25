@@ -114,7 +114,9 @@ func (p *Pump) Run(ctx context.Context, consume func(context.Context, Envelope) 
 		if err == nil {
 			return nil
 		}
-		p.logger.Warn("gateway stopped", "err", err)
+		if err.Error() != "gateway requested reconnect" {
+			p.logger.Warn("gateway stopped", "err", err)
+		}
 
 		current := delay
 		if ready {
