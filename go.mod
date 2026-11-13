@@ -1,4 +1,4 @@
-module github.com/iniwex5/qqbot
+module github.com/kimoju/qqbot
 
 go 1.24.0
 

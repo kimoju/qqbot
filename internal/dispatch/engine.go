@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iniwex5/qqbot/internal/stream"
+	"github.com/kimoju/qqbot/internal/stream"
 )
 
 type Config struct {

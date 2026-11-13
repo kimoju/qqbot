@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iniwex5/qqbot/internal/stream"
+	"github.com/kimoju/qqbot/internal/stream"
 )
 
 func TestEngineParsesDirectCommand(t *testing.T) {

@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iniwex5/qqbot/internal/auth"
-	"github.com/iniwex5/qqbot/internal/dispatch"
-	"github.com/iniwex5/qqbot/internal/rest"
-	"github.com/iniwex5/qqbot/internal/stream"
+	"github.com/kimoju/qqbot/internal/auth"
+	"github.com/kimoju/qqbot/internal/dispatch"
+	"github.com/kimoju/qqbot/internal/rest"
+	"github.com/kimoju/qqbot/internal/stream"
 )
 
 type App struct {
