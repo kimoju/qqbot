@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,12 +29,38 @@ type Config struct {
 }
 
 type Pump struct {
-	lookup  GatewayLookup
-	tokens  TokenProvider
-	intents int
-	logger  *slog.Logger
-	dialer  *websocket.Dialer
-	wait    func(context.Context, time.Duration) error
+	lookup      GatewayLookup
+	tokens      TokenProvider
+	intents     int
+	logger      *slog.Logger
+	dialer      *websocket.Dialer
+	wait        func(context.Context, time.Duration) error
+	readTimeout func(time.Duration) time.Duration
+}
+
+type sessionConn struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+func (s *sessionConn) writeJSON(v any) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return s.conn.WriteJSON(v)
+}
+
+func (s *sessionConn) bestEffortCloseFrame() {
+	if !s.writeMu.TryLock() {
+		return
+	}
+	defer s.writeMu.Unlock()
+	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	_ = s.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(100*time.Millisecond))
+}
+
+func (s *sessionConn) close() error {
+	return s.conn.Close()
 }
 
 type Envelope struct {
@@ -91,13 +118,42 @@ func New(cfg Config) *Pump {
 		intents = 1 << 25
 	}
 	return &Pump{
-		lookup:  cfg.Lookup,
-		tokens:  cfg.Tokens,
-		intents: intents,
-		logger:  logger,
-		dialer:  websocket.DefaultDialer,
-		wait:    pause,
+		lookup:      cfg.Lookup,
+		tokens:      cfg.Tokens,
+		intents:     intents,
+		logger:      logger,
+		dialer:      websocket.DefaultDialer,
+		wait:        pause,
+		readTimeout: defaultReadTimeout,
 	}
+}
+
+func (p *Pump) effectiveDialer() *websocket.Dialer {
+	if p.dialer != nil {
+		return p.dialer
+	}
+	return websocket.DefaultDialer
+}
+
+func (p *Pump) effectiveWait(ctx context.Context, d time.Duration) error {
+	if p.wait != nil {
+		return p.wait(ctx, d)
+	}
+	return pause(ctx, d)
+}
+
+func (p *Pump) effectiveReadTimeout(heartbeatInterval time.Duration) time.Duration {
+	if p.readTimeout != nil {
+		return p.readTimeout(heartbeatInterval)
+	}
+	return defaultReadTimeout(heartbeatInterval)
+}
+
+func defaultReadTimeout(heartbeatInterval time.Duration) time.Duration {
+	if heartbeatInterval <= 0 {
+		return 45 * time.Second
+	}
+	return 2*heartbeatInterval + 15*time.Second
 }
 
 func (p *Pump) Run(ctx context.Context, consume func(context.Context, Envelope) error) error {
@@ -114,56 +170,73 @@ func (p *Pump) Run(ctx context.Context, consume func(context.Context, Envelope) 
 		if err == nil {
 			return nil
 		}
-		if err.Error() != "gateway requested reconnect" {
+		if err.Error() != "gateway requested reconnect" && p.logger != nil {
 			p.logger.Warn("gateway stopped", "err", err)
 		}
 
-		current := delay
+		var current time.Duration
 		if ready {
 			delay = time.Second
-		} else if delay < 30*time.Second {
-			delay *= 2
-			if delay > 30*time.Second {
-				delay = 30 * time.Second
+			current = delay
+		} else {
+			current = delay
+			if delay < 30*time.Second {
+				delay *= 2
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
+				}
 			}
 		}
 
-		if err := p.wait(ctx, current); err != nil {
+		if err := p.effectiveWait(ctx, current); err != nil {
 			return nil
 		}
 	}
 }
 
 func (p *Pump) runSession(ctx context.Context, consume func(context.Context, Envelope) error) (bool, error) {
-	token, err := p.tokens.Token(ctx)
-	if err != nil {
-		return false, err
-	}
 	wsURL, err := p.lookup.Gateway(ctx)
 	if err != nil {
 		return false, err
 	}
-
-	conn, _, err := p.dialer.DialContext(ctx, wsURL, nil)
+	token, err := p.tokens.Token(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer conn.Close()
 
-	closeStop := make(chan struct{})
+	rawConn, _, err := p.effectiveDialer().DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return false, err
+	}
+	sc := &sessionConn{conn: rawConn}
+
+	sessionDone := make(chan struct{})
+	var bgWG sync.WaitGroup
+	defer func() {
+		close(sessionDone)
+		_ = sc.close()
+		bgWG.Wait()
+	}()
+
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		select {
 		case <-ctx.Done():
-			_ = conn.Close()
-		case <-closeStop:
+			sc.bestEffortCloseFrame()
+			_ = sc.close()
+		case <-sessionDone:
 		}
 	}()
-	defer close(closeStop)
 
 	var ready bool
-	var seq atomic.Int64
-	heartStop := make(chan struct{})
-	defer close(heartStop)
+	var seq atomic.Pointer[int64]
+	var heartOnce sync.Once
+
+	readWindow := p.effectiveReadTimeout(0)
+	if readWindow > 0 {
+		_ = sc.conn.SetReadDeadline(time.Now().Add(readWindow))
+	}
 
 	for {
 		select {
@@ -172,9 +245,15 @@ func (p *Pump) runSession(ctx context.Context, consume func(context.Context, Env
 		default:
 		}
 
-		_, raw, err := conn.ReadMessage()
+		_, raw, err := sc.conn.ReadMessage()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ready, nil
+			}
 			return ready, err
+		}
+		if readWindow > 0 {
+			_ = sc.conn.SetReadDeadline(time.Now().Add(readWindow))
 		}
 
 		packet := frame{}
@@ -182,7 +261,8 @@ func (p *Pump) runSession(ctx context.Context, consume func(context.Context, Env
 			continue
 		}
 		if packet.S != nil {
-			seq.Store(*packet.S)
+			s := *packet.S
+			seq.Store(&s)
 		}
 
 		switch packet.Op {
@@ -192,12 +272,22 @@ func (p *Pump) runSession(ctx context.Context, consume func(context.Context, Env
 				return ready, err
 			}
 			if greeting.HeartbeatMS > 0 {
-				go heartbeat(ctx, conn, greeting.HeartbeatMS, &seq, heartStop)
+				hbInterval := time.Duration(greeting.HeartbeatMS) * time.Millisecond
+				readWindow = p.effectiveReadTimeout(hbInterval)
+				if readWindow > 0 {
+					_ = sc.conn.SetReadDeadline(time.Now().Add(readWindow))
+				}
+				heartOnce.Do(func() {
+					bgWG.Add(1)
+					go func() {
+						defer bgWG.Done()
+						heartbeat(ctx, sc, hbInterval, &seq, sessionDone)
+					}()
+				})
 			}
-			if err := identify(conn, token, p.intents); err != nil {
+			if err := identify(sc, token, p.intents); err != nil {
 				return ready, err
 			}
-			ready = true
 		case 11:
 			continue
 		case 7:
@@ -205,12 +295,25 @@ func (p *Pump) runSession(ctx context.Context, consume func(context.Context, Env
 		case 9:
 			return ready, errors.New("gateway session invalid")
 		case 0:
-			envelope, ok := decode(packet.T, packet.D)
+			eventType := strings.TrimSpace(packet.T)
+			if eventType == "READY" || eventType == "RESUMED" {
+				ready = true
+				continue
+			}
+			envelope, ok := decode(eventType, packet.D)
 			if !ok {
 				continue
 			}
 			if err := consume(ctx, envelope); err != nil {
-				return ready, err
+				if ctx.Err() != nil {
+					return ready, nil
+				}
+				if p.logger != nil {
+					p.logger.Warn("consume event failed", "type", eventType, "id", envelope.ID, "err", err)
+				}
+			}
+			if readWindow > 0 {
+				_ = sc.conn.SetReadDeadline(time.Now().Add(readWindow))
 			}
 		}
 	}
@@ -263,8 +366,8 @@ func decode(kind string, raw json.RawMessage) (Envelope, bool) {
 	}
 }
 
-func identify(conn *websocket.Conn, token string, intents int) error {
-	return conn.WriteJSON(map[string]any{
+func identify(sc *sessionConn, token string, intents int) error {
+	return sc.writeJSON(map[string]any{
 		"op": 2,
 		"d": map[string]any{
 			"token":   "QQBot " + token,
@@ -274,8 +377,11 @@ func identify(conn *websocket.Conn, token string, intents int) error {
 	})
 }
 
-func heartbeat(ctx context.Context, conn *websocket.Conn, everyMS int64, seq *atomic.Int64, stop <-chan struct{}) {
-	ticker := time.NewTicker(time.Duration(everyMS) * time.Millisecond)
+func heartbeat(ctx context.Context, sc *sessionConn, interval time.Duration, seq *atomic.Pointer[int64], stop <-chan struct{}) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -284,10 +390,17 @@ func heartbeat(ctx context.Context, conn *websocket.Conn, everyMS int64, seq *at
 		case <-stop:
 			return
 		case <-ticker.C:
-			_ = conn.WriteJSON(map[string]any{
+			var d any
+			if current := seq.Load(); current != nil {
+				d = *current
+			}
+			if err := sc.writeJSON(map[string]any{
 				"op": 1,
-				"d":  seq.Load(),
-			})
+				"d":  d,
+			}); err != nil {
+				_ = sc.close()
+				return
+			}
 		}
 	}
 }

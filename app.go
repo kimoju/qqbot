@@ -18,6 +18,9 @@ type App struct {
 	settings Settings
 	options  options
 
+	httpClient    *http.Client
+	ownHTTPClient bool
+
 	delivery  *rest.Client
 	eventPump *stream.Pump
 	engine    *dispatch.Engine
@@ -43,7 +46,9 @@ func New(settings Settings, opts ...Option) (*App, error) {
 	}
 
 	httpClient := settings.HTTPClient
+	ownHTTPClient := false
 	if httpClient == nil {
+		ownHTTPClient = true
 		httpClient = &http.Client{
 			Timeout: settings.Timeout,
 			Transport: &http.Transport{
@@ -81,10 +86,12 @@ func New(settings Settings, opts ...Option) (*App, error) {
 	})
 
 	return &App{
-		settings:  settings,
-		options:   cfg,
-		delivery:  delivery,
-		eventPump: pump,
+		settings:      settings,
+		options:       cfg,
+		httpClient:    httpClient,
+		ownHTTPClient: ownHTTPClient,
+		delivery:      delivery,
+		eventPump:     pump,
 		engine: dispatch.New(dispatch.Config{
 			Prefix:      cfg.prefix,
 			DedupWindow: cfg.dedupWindow,
@@ -198,6 +205,9 @@ func (a *App) Close() error {
 	a.mu.Unlock()
 	if stop != nil {
 		stop()
+	}
+	if a.ownHTTPClient && a.httpClient != nil {
+		a.httpClient.CloseIdleConnections()
 	}
 	return nil
 }

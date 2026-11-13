@@ -3,6 +3,8 @@ package qqbot
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -202,6 +204,239 @@ func TestAppOnTextHandlesNonCommand(t *testing.T) {
 	}
 
 	assertMessage(t, msg, "/v2/groups/group-9/messages", "QQBot token-1", "text-handler", "msg-text", 1)
+}
+
+func TestAppCloseCleansUpOwnedHTTPClientAndPreservesExternalClient(t *testing.T) {
+	t.Parallel()
+
+	newConnTrackingServer := func(t *testing.T) (*httptest.Server, <-chan struct{}, <-chan struct{}) {
+		t.Helper()
+		idleCh := make(chan struct{}, 8)
+		closedCh := make(chan struct{}, 8)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/app/getAppAccessToken", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "token-1",
+				"expires_in":   7200,
+			})
+		})
+		mux.HandleFunc("/v2/users/", func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":        "reply-1",
+				"timestamp": "2026-03-29T15:01:00Z",
+			})
+		})
+
+		srv := httptest.NewUnstartedServer(mux)
+		srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			switch state {
+			case http.StateIdle:
+				select {
+				case idleCh <- struct{}{}:
+				default:
+				}
+			case http.StateClosed:
+				select {
+				case closedCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+		srv.Start()
+		t.Cleanup(srv.Close)
+		return srv, idleCh, closedCh
+	}
+
+	t.Run("closes_idle_connections_when_http_client_is_owned", func(t *testing.T) {
+		t.Parallel()
+
+		srv, idleCh, closedCh := newConnTrackingServer(t)
+
+		app, err := New(Settings{
+			AppID:         "app-id",
+			AppSecret:     "secret",
+			TokenEndpoint: srv.URL + "/app/getAppAccessToken",
+			BaseEndpoint:  srv.URL,
+		})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if !app.ownHTTPClient {
+			t.Fatal("ownHTTPClient = false, want true")
+		}
+
+		if _, err := app.Send(context.Background(), Delivery{
+			To:   Recipient{Kind: DirectRecipient, ID: "user-1"},
+			Body: "hello",
+		}); err != nil {
+			t.Fatalf("Send() error = %v", err)
+		}
+
+		select {
+		case <-idleCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for keep-alive connection to become idle")
+		}
+
+		// Before Close(), the idle connection should remain open.
+		select {
+		case <-closedCh:
+			t.Fatal("idle connection closed prematurely before App.Close()")
+		case <-time.After(30 * time.Millisecond):
+		}
+
+		if err := app.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		select {
+		case <-closedCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for App.Close() to close idle HTTP connection")
+		}
+	})
+
+	t.Run("does_not_close_caller_supplied_http_client_idle_connections", func(t *testing.T) {
+		t.Parallel()
+
+		srv, idleCh, closedCh := newConnTrackingServer(t)
+		customClient := &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        16,
+				MaxIdleConnsPerHost: 16,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
+		t.Cleanup(customClient.CloseIdleConnections)
+
+		app, err := New(Settings{
+			AppID:         "app-id",
+			AppSecret:     "secret",
+			TokenEndpoint: srv.URL + "/app/getAppAccessToken",
+			BaseEndpoint:  srv.URL,
+			HTTPClient:    customClient,
+		})
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if app.ownHTTPClient {
+			t.Fatal("ownHTTPClient = true, want false")
+		}
+
+		if _, err := app.Send(context.Background(), Delivery{
+			To:   Recipient{Kind: DirectRecipient, ID: "user-1"},
+			Body: "hello",
+		}); err != nil {
+			t.Fatalf("Send() error = %v", err)
+		}
+
+		select {
+		case <-idleCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for keep-alive connection to become idle")
+		}
+
+		if err := app.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		// Caller-owned HTTPClient's idle socket must remain open after App.Close().
+		select {
+		case <-closedCh:
+			t.Fatal("caller-supplied HTTPClient connection was unexpectedly closed by App.Close()")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		customClient.CloseIdleConnections()
+		select {
+		case <-closedCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timeout waiting for customClient.CloseIdleConnections()")
+		}
+	})
+}
+
+func TestAppContinuesAfterHandlerErrorAndStopsViaClose(t *testing.T) {
+	t.Parallel()
+
+	var wsConns atomic.Int32
+	h := newTestHarness(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		wsConns.Add(1)
+		writeFrame(t, conn, map[string]any{
+			"op": 10,
+			"d":  map[string]any{"heartbeat_interval": 1000},
+		})
+		readIdentify(t, conn)
+		writeFrame(t, conn, map[string]any{
+			"op": 0,
+			"s":  1,
+			"t":  "READY",
+			"d":  map[string]any{},
+		})
+		writeFrame(t, conn, map[string]any{
+			"op": 0,
+			"s":  2,
+			"t":  "C2C_MESSAGE_CREATE",
+			"d": map[string]any{
+				"id":        "msg-err",
+				"content":   "/fail",
+				"timestamp": "2026-03-29T15:00:00Z",
+				"author":    map[string]any{"user_openid": "user-1"},
+			},
+		})
+		writeFrame(t, conn, map[string]any{
+			"op": 0,
+			"s":  3,
+			"t":  "C2C_MESSAGE_CREATE",
+			"d": map[string]any{
+				"id":        "msg-next",
+				"content":   "/ok",
+				"timestamp": "2026-03-29T15:00:01Z",
+				"author":    map[string]any{"user_openid": "user-1"},
+			},
+		})
+		<-time.After(2 * time.Second)
+	})
+	defer h.Close()
+
+	app, err := New(h.Settings())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	app.Command("fail", func(context.Context, Conversation, ParsedCommand) error {
+		return errors.New("handler boom")
+	})
+	app.Command("ok", func(ctx context.Context, c Conversation, _ ParsedCommand) error {
+		_, err := c.RespondText(ctx, "recovered")
+		return err
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- app.Run(context.Background())
+	}()
+
+	msg := h.WaitMessage(t)
+	if err := app.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() timeout after App.Close()")
+	}
+
+	if got := wsConns.Load(); got != 1 {
+		t.Fatalf("wsConns = %d, want 1", got)
+	}
+	assertMessage(t, msg, "/v2/users/user-1/messages", "QQBot token-1", "recovered", "msg-next", 1)
 }
 
 type captured struct {

@@ -8,9 +8,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	maxResponseBytes = 1 << 20
+	maxDrainBytes    = 64 << 10
 )
 
 type TokenProvider interface {
@@ -93,9 +99,14 @@ func New(cfg Config) *Client {
 		defaultKind = "text"
 	}
 
+	client := cfg.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+
 	return &Client{
 		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
-		client:      cfg.Client,
+		client:      client,
 		tokens:      cfg.Tokens,
 		retryCount:  retryCount,
 		retryDelay:  retryDelay,
@@ -104,43 +115,50 @@ func New(cfg Config) *Client {
 }
 
 func (c *Client) Gateway(ctx context.Context) (string, error) {
-	token, err := c.tokens.Token(ctx)
-	if err != nil {
-		return "", err
+	if c.tokens == nil {
+		return "", errors.New("tokens 不能为空")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/gateway", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Authorization", "QQBot "+token)
+	for authAttempt := 0; authAttempt < 2; authAttempt++ {
+		token, err := c.tokens.Token(ctx)
+		if err != nil {
+			return "", err
+		}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/gateway", nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "QQBot "+token)
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		c.tokens.Invalidate()
-		return c.Gateway(ctx)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("gateway request failed: status=%d body=%s", resp.StatusCode, string(body))
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return "", err
+		}
+
+		body, err := readAndCloseBody(resp.Body)
+		if err != nil {
+			return "", err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && authAttempt == 0 {
+			c.tokens.Invalidate()
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return "", parseAPIError(resp, body)
+		}
+
+		reply := gatewayReply{}
+		if err := json.Unmarshal(body, &reply); err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(reply.URL) == "" {
+			return "", errors.New("gateway url 为空")
+		}
+		return reply.URL, nil
 	}
 
-	reply := gatewayReply{}
-	if err := json.Unmarshal(body, &reply); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(reply.URL) == "" {
-		return "", errors.New("gateway url 为空")
-	}
-	return reply.URL, nil
+	return "", errors.New("gateway request failed")
 }
 
 func (c *Client) Send(ctx context.Context, req SendRequest) (SendResult, error) {
@@ -169,54 +187,87 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (SendResult, error) 
 }
 
 func (c *Client) sendOnce(ctx context.Context, req SendRequest) (SendResult, error) {
-	token, err := c.tokens.Token(ctx)
+	if c.tokens == nil {
+		return SendResult{}, errors.New("tokens 不能为空")
+	}
+
+	endpoint, body, err := c.encode(req)
 	if err != nil {
 		return SendResult{}, err
 	}
 
-	url, body, err := c.encode(req)
-	if err != nil {
-		return SendResult{}, err
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return SendResult{}, err
-	}
-	httpReq.Header.Set("Authorization", "QQBot "+token)
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return SendResult{}, err
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return SendResult{}, err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		c.tokens.Invalidate()
-		return c.sendOnce(ctx, req)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		apiErr := &apiError{
-			StatusCode: resp.StatusCode,
-			TraceID:    resp.Header.Get("x-tps-trace-id"),
+	for authAttempt := 0; authAttempt < 2; authAttempt++ {
+		token, err := c.tokens.Token(ctx)
+		if err != nil {
+			return SendResult{}, err
 		}
-		_ = json.Unmarshal(raw, apiErr)
-		return SendResult{}, apiErr
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return SendResult{}, err
+		}
+		httpReq.Header.Set("Authorization", "QQBot "+token)
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(httpReq)
+		if err != nil {
+			return SendResult{}, err
+		}
+
+		raw, err := readAndCloseBody(resp.Body)
+		if err != nil {
+			return SendResult{}, err
+		}
+		if resp.StatusCode == http.StatusUnauthorized && authAttempt == 0 {
+			c.tokens.Invalidate()
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return SendResult{}, parseAPIError(resp, raw)
+		}
+
+		reply := messageReply{}
+		if err := json.Unmarshal(raw, &reply); err != nil {
+			return SendResult{}, err
+		}
+		return SendResult{
+			ID: reply.ID,
+			At: parseMoment(reply.Timestamp),
+		}, nil
 	}
 
-	reply := messageReply{}
-	if err := json.Unmarshal(raw, &reply); err != nil {
-		return SendResult{}, err
+	return SendResult{}, errors.New("send request failed")
+}
+
+func readAndCloseBody(body io.ReadCloser) ([]byte, error) {
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, maxDrainBytes))
+		_ = body.Close()
+	}()
+	return io.ReadAll(io.LimitReader(body, maxResponseBytes))
+}
+
+func parseAPIError(resp *http.Response, raw []byte) *apiError {
+	apiErr := &apiError{
+		StatusCode: resp.StatusCode,
+		TraceID:    resp.Header.Get("x-tps-trace-id"),
 	}
-	return SendResult{
-		ID: reply.ID,
-		At: parseMoment(reply.Timestamp),
-	}, nil
+	if err := json.Unmarshal(raw, apiErr); err != nil && apiErr.Message == "" {
+		apiErr.Message = strings.TrimSpace(string(raw))
+	}
+	return apiErr
+}
+
+func escapePathSegment(seg string) string {
+	escaped := url.PathEscape(seg)
+	switch escaped {
+	case ".":
+		return "%2E"
+	case "..":
+		return "%2E%2E"
+	default:
+		return escaped
+	}
 }
 
 func (c *Client) encode(req SendRequest) (string, []byte, error) {
@@ -261,13 +312,14 @@ func (c *Client) encode(req SendRequest) (string, []byte, error) {
 		return "", nil, err
 	}
 
+	escapedID := escapePathSegment(req.RecipientID)
 	switch req.RecipientKind {
 	case "c2c":
-		return fmt.Sprintf("%s/v2/users/%s/messages", c.baseURL, req.RecipientID), body, nil
+		return fmt.Sprintf("%s/v2/users/%s/messages", c.baseURL, escapedID), body, nil
 	case "group":
-		return fmt.Sprintf("%s/v2/groups/%s/messages", c.baseURL, req.RecipientID), body, nil
+		return fmt.Sprintf("%s/v2/groups/%s/messages", c.baseURL, escapedID), body, nil
 	case "channel":
-		return fmt.Sprintf("%s/channels/%s/messages", c.baseURL, req.RecipientID), body, nil
+		return fmt.Sprintf("%s/channels/%s/messages", c.baseURL, escapedID), body, nil
 	default:
 		return "", nil, errors.New("recipient_kind 只支持 c2c/group/channel")
 	}
