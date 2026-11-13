@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	maxRefreshLead       = 45 * time.Second
+	defaultTokenLifetime = 7200
+)
+
 type Config struct {
 	AppID     string
 	AppSecret string
@@ -26,10 +31,12 @@ type Source struct {
 	endpoint string
 	appID    string
 	secret   string
+	now      func() time.Time
 
-	mu      sync.RWMutex
-	token   string
-	expires time.Time
+	mu        sync.RWMutex
+	token     string
+	expires   time.Time
+	refreshAt time.Time
 }
 
 type tokenPayload struct {
@@ -59,9 +66,28 @@ func New(cfg Config) (*Source, error) {
 	}, nil
 }
 
+func (s *Source) effectiveNow() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+func refreshLead(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return 0
+	}
+	lead := ttl / 3
+	if lead > maxRefreshLead {
+		lead = maxRefreshLead
+	}
+	return lead
+}
+
 func (s *Source) Token(ctx context.Context) (string, error) {
+	now := s.effectiveNow()
 	s.mu.RLock()
-	if s.token != "" && time.Until(s.expires) > 5*time.Minute {
+	if s.token != "" && now.Before(s.refreshAt) {
 		token := s.token
 		s.mu.RUnlock()
 		return token, nil
@@ -70,7 +96,8 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.token != "" && time.Until(s.expires) > 5*time.Minute {
+	now = s.effectiveNow()
+	if s.token != "" && now.Before(s.refreshAt) {
 		return s.token, nil
 	}
 
@@ -111,10 +138,14 @@ func (s *Source) Token(ctx context.Context) (string, error) {
 
 	lifetime := seconds(payload.ExpiresIn)
 	if lifetime <= 0 {
-		lifetime = 7200
+		lifetime = defaultTokenLifetime
 	}
+	fetchedAt := s.effectiveNow()
+	ttl := time.Duration(lifetime) * time.Second
+	lead := refreshLead(ttl)
 	s.token = payload.AccessToken
-	s.expires = time.Now().Add(time.Duration(lifetime) * time.Second)
+	s.expires = fetchedAt.Add(ttl)
+	s.refreshAt = fetchedAt.Add(ttl - lead)
 	return s.token, nil
 }
 
@@ -123,6 +154,7 @@ func (s *Source) Invalidate() {
 	defer s.mu.Unlock()
 	s.token = ""
 	s.expires = time.Time{}
+	s.refreshAt = time.Time{}
 }
 
 func seconds(raw any) int64 {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -437,6 +438,118 @@ func TestAppContinuesAfterHandlerErrorAndStopsViaClose(t *testing.T) {
 		t.Fatalf("wsConns = %d, want 1", got)
 	}
 	assertMessage(t, msg, "/v2/users/user-1/messages", "QQBot token-1", "recovered", "msg-next", 1)
+}
+
+func TestAppCloseBeforeAndConcurrentWithRunRace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("close_before_run_never_starts_or_hangs", func(t *testing.T) {
+		t.Parallel()
+
+		var wsConns atomic.Int32
+		h := newTestHarness(t, func(conn *websocket.Conn) {
+			wsConns.Add(1)
+			conn.Close()
+		})
+		defer h.Close()
+
+		app, err := New(h.Settings())
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if err := app.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- app.Run(context.Background())
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Run() after Close() error = %v, want nil", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Run() hung after prior Close()")
+		}
+		if got := wsConns.Load(); got != 0 {
+			t.Fatalf("wsConns = %d, want 0", got)
+		}
+	})
+
+	t.Run("concurrent_run_and_close_stress", func(t *testing.T) {
+		t.Parallel()
+
+		h := newTestHarness(t, func(conn *websocket.Conn) {
+			defer conn.Close()
+			_ = conn.WriteJSON(map[string]any{
+				"op": 10,
+				"d":  map[string]any{"heartbeat_interval": 1000},
+			})
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		})
+		defer h.Close()
+
+		for iter := 0; iter < 30; iter++ {
+			app, err := New(h.Settings())
+			if err != nil {
+				t.Fatalf("iter %d New() error = %v", iter, err)
+			}
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			errCh := make(chan error, 4)
+
+			for g := 0; g < 2; g++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					if rErr := app.Run(context.Background()); rErr != nil && rErr.Error() != "app 已启动" {
+						errCh <- rErr
+					}
+				}()
+			}
+			for g := 0; g < 2; g++ {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					<-start
+					if idx == 1 {
+						time.Sleep(time.Duration(iter%4) * time.Millisecond)
+					}
+					if cErr := app.Close(); cErr != nil {
+						errCh <- cErr
+					}
+				}(g)
+			}
+
+			close(start)
+
+			waitDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(waitDone)
+			}()
+
+			select {
+			case <-waitDone:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("iter %d hung during concurrent Run/Close", iter)
+			}
+
+			close(errCh)
+			for e := range errCh {
+				t.Fatalf("iter %d unexpected error: %v", iter, e)
+			}
+		}
+	})
 }
 
 type captured struct {

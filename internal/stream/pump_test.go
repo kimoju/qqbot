@@ -126,18 +126,20 @@ func TestPumpOp9BeforeReadyUsesExponentialBackoffAndResetsAfterReady(t *testing.
 	got := append([]time.Duration(nil), waits...)
 	mu.Unlock()
 
-	want := []time.Duration{
+	wantBase := []time.Duration{
 		1 * time.Second, // after attempt 1 (op: 9 before READY)
 		2 * time.Second, // after attempt 2 (op: 9 before READY)
 		4 * time.Second, // after attempt 3 (op: 9 before READY)
 		1 * time.Second, // after attempt 4 (READY received before op: 7 -> reset!)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("waits = %v, want %v", got, want)
+	if len(got) != len(wantBase) {
+		t.Fatalf("waits = %v, want len %d", got, len(wantBase))
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("waits[%d] = %v, want %v (all = %v)", i, got[i], want[i], got)
+	for i, base := range wantBase {
+		minWait := time.Duration(float64(base) * 0.8)
+		maxWait := time.Duration(float64(base)*1.2) + time.Millisecond
+		if got[i] < minWait || got[i] > maxWait {
+			t.Fatalf("waits[%d] = %v, want within jitter range [%v, %v] (all = %v)", i, got[i], minWait, maxWait, got)
 		}
 	}
 }
@@ -460,12 +462,18 @@ func TestPumpConsumeErrorDoesNotDropSession(t *testing.T) {
 		Logger: slog.New(slog.NewTextHandler(safeWriter, nil)),
 	})
 
-	var received []string
+	var recvMu sync.Mutex
+	received := make(map[string]bool)
+	failReturned := make(chan struct{})
 	err := pump.Run(ctx, func(_ context.Context, env Envelope) error {
-		received = append(received, env.ID)
+		recvMu.Lock()
+		received[env.ID] = true
+		recvMu.Unlock()
 		if env.ID == "msg-fail" {
+			defer close(failReturned)
 			return errors.New("downstream reply failed")
 		}
+		<-failReturned
 		cancel()
 		return nil
 	})
@@ -476,8 +484,8 @@ func TestPumpConsumeErrorDoesNotDropSession(t *testing.T) {
 	if got := sessions.Load(); got != 1 {
 		t.Fatalf("websocket sessions = %d, want 1 (session must stay alive after consume error)", got)
 	}
-	if len(received) != 2 || received[0] != "msg-fail" || received[1] != "msg-ok" {
-		t.Fatalf("received events = %v, want [msg-fail msg-ok]", received)
+	if !received["msg-fail"] || !received["msg-ok"] {
+		t.Fatalf("received events = %v, want msg-fail and msg-ok", received)
 	}
 	logMu.Lock()
 	logs := logBuf.String()
@@ -748,4 +756,507 @@ type writerFunc func([]byte) (int, error)
 
 func (fn writerFunc) Write(p []byte) (int, error) {
 	return fn(p)
+}
+
+type rotatableTokens struct {
+	mu          sync.Mutex
+	current     string
+	rotated     string
+	invalidated int
+}
+
+func (r *rotatableTokens) Token(context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.current, nil
+}
+
+func (r *rotatableTokens) Invalidate() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.invalidated++
+	if r.rotated != "" {
+		r.current = r.rotated
+	}
+}
+
+func TestPumpSessionResumeOp6AndOp9FallbackToIdentify(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	type authPacket struct {
+		Op int            `json:"op"`
+		D  map[string]any `json:"d"`
+	}
+
+	var mu sync.Mutex
+	var handshakes []authPacket
+	var waits []time.Duration
+	var sessions atomic.Int32
+
+	_, wsURL := newWSServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		sNum := sessions.Add(1)
+
+		_ = conn.WriteJSON(map[string]any{
+			"op": 10,
+			"d":  map[string]any{"heartbeat_interval": 1000},
+		})
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var pkt authPacket
+		if err := json.Unmarshal(raw, &pkt); err != nil {
+			return
+		}
+		mu.Lock()
+		handshakes = append(handshakes, pkt)
+		mu.Unlock()
+
+		switch sNum {
+		case 1:
+			// Fresh Identify -> READY with session_id -> event s=9 -> op: 7 Reconnect.
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  1,
+				"t":  "READY",
+				"d":  map[string]any{"session_id": "sess-100"},
+			})
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  9,
+				"t":  "C2C_MESSAGE_CREATE",
+				"d": map[string]any{
+					"id":        "m-9",
+					"content":   "first",
+					"timestamp": "2026-03-29T15:00:00Z",
+					"author":    map[string]any{"user_openid": "u-1"},
+				},
+			})
+			_ = conn.WriteJSON(map[string]any{"op": 7})
+		case 2:
+			// Expect op: 6 Resume with session_id=sess-100, seq=9 -> RESUMED s=10 -> TCP drop.
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  10,
+				"t":  "RESUMED",
+				"d":  map[string]any{},
+			})
+			return
+		case 3:
+			// Expect op: 6 Resume with seq=10 -> reject with op: 9 (d: false).
+			_ = conn.WriteJSON(map[string]any{
+				"op": 9,
+				"d":  false,
+			})
+		default:
+			// Expect fresh op: 2 Identify after session cleared!
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  1,
+				"t":  "READY",
+				"d":  map[string]any{"session_id": "sess-200"},
+			})
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  2,
+				"t":  "C2C_MESSAGE_CREATE",
+				"d": map[string]any{
+					"id":        "m-final",
+					"content":   "done",
+					"timestamp": "2026-03-29T15:00:01Z",
+					"author":    map[string]any{"user_openid": "u-1"},
+				},
+			})
+			<-ctx.Done()
+		}
+	})
+
+	pump := New(Config{
+		Lookup: staticLookup{url: wsURL},
+		Tokens: staticTokens{token: "tok-resume"},
+		Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+	pump.wait = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		waits = append(waits, d)
+		mu.Unlock()
+		return nil
+	}
+
+	err := pump.Run(ctx, func(_ context.Context, env Envelope) error {
+		if env.ID == "m-final" {
+			cancel()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(handshakes) != 4 {
+		t.Fatalf("handshakes len = %d, want 4: %+v", len(handshakes), handshakes)
+	}
+	if handshakes[0].Op != 2 {
+		t.Fatalf("session 1 op = %d, want 2 (Identify)", handshakes[0].Op)
+	}
+	if handshakes[1].Op != 6 || handshakes[1].D["session_id"] != "sess-100" || int(handshakes[1].D["seq"].(float64)) != 9 {
+		t.Fatalf("session 2 = %+v, want op=6 session_id=sess-100 seq=9", handshakes[1])
+	}
+	if handshakes[2].Op != 6 || handshakes[2].D["session_id"] != "sess-100" || int(handshakes[2].D["seq"].(float64)) != 10 {
+		t.Fatalf("session 3 = %+v, want op=6 session_id=sess-100 seq=10", handshakes[2])
+	}
+	if handshakes[3].Op != 2 {
+		t.Fatalf("session 4 op = %d, want 2 (fresh Identify after op: 9 d:false)", handshakes[3].Op)
+	}
+	// After op: 9 on resume (wait index 2), pause should be brief jittered ~2s ([1.6s, 2.4s]).
+	if len(waits) < 3 || waits[2] < 1600*time.Millisecond || waits[2] > 2401*time.Millisecond {
+		t.Fatalf("op:9 invalid resume wait = %v, want in [1.6s, 2.4s]", waits)
+	}
+}
+
+func TestPumpCloseCode4004InvalidatesTokenAndClearsSession(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tokens := &rotatableTokens{current: "tok-stale", rotated: "tok-fresh"}
+	var sessions atomic.Int32
+	var secondOp atomic.Int32
+	var secondToken atomic.Value
+
+	_, wsURL := newWSServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		sNum := sessions.Add(1)
+
+		_ = conn.WriteJSON(map[string]any{
+			"op": 10,
+			"d":  map[string]any{"heartbeat_interval": 1000},
+		})
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var pkt struct {
+			Op int            `json:"op"`
+			D  map[string]any `json:"d"`
+		}
+		_ = json.Unmarshal(raw, &pkt)
+
+		if sNum == 1 {
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  1,
+				"t":  "READY",
+				"d":  map[string]any{"session_id": "sess-4004"},
+			})
+			msg := websocket.FormatCloseMessage(4004, "Authentication failed")
+			_ = conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second))
+			return
+		}
+
+		secondOp.Store(int32(pkt.Op))
+		if tok, ok := pkt.D["token"].(string); ok {
+			secondToken.Store(tok)
+		}
+		_ = conn.WriteJSON(map[string]any{
+			"op": 0,
+			"s":  1,
+			"t":  "READY",
+			"d":  map[string]any{"session_id": "sess-ok"},
+		})
+		cancel()
+		<-ctx.Done()
+	})
+
+	pump := New(Config{
+		Lookup: staticLookup{url: wsURL},
+		Tokens: tokens,
+		Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+	pump.wait = func(context.Context, time.Duration) error { return nil }
+
+	if err := pump.Run(ctx, func(context.Context, Envelope) error { return nil }); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	tokens.mu.Lock()
+	invCount := tokens.invalidated
+	tokens.mu.Unlock()
+	if invCount < 1 {
+		t.Fatalf("tokens.invalidated = %d, want >= 1", invCount)
+	}
+	if got := secondOp.Load(); got != 2 {
+		t.Fatalf("second session op = %d, want 2 (fresh Identify)", got)
+	}
+	if got, _ := secondToken.Load().(string); got != "QQBot tok-fresh" {
+		t.Fatalf("second session token = %q, want %q", got, "QQBot tok-fresh")
+	}
+}
+
+func TestPumpDecoupledConsumeDoesNotStarvePingPongOrHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	slowEntered := make(chan struct{})
+	unblockSlow := make(chan struct{})
+	pongCh := make(chan string, 1)
+	fastDone := make(chan struct{})
+	var sessions atomic.Int32
+
+	_, wsURL := newWSServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		sessions.Add(1)
+		var srvWriteMu sync.Mutex
+		writeServerJSON := func(v any) error {
+			srvWriteMu.Lock()
+			defer srvWriteMu.Unlock()
+			return conn.WriteJSON(v)
+		}
+
+		conn.SetPongHandler(func(appData string) error {
+			select {
+			case pongCh <- appData:
+			default:
+			}
+			return nil
+		})
+
+		go func() {
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				var pkt frame
+				if json.Unmarshal(raw, &pkt) == nil && pkt.Op == 1 {
+					_ = writeServerJSON(map[string]any{"op": 11})
+				}
+			}
+		}()
+
+		_ = writeServerJSON(map[string]any{
+			"op": 10,
+			"d":  map[string]any{"heartbeat_interval": 15},
+		})
+		_ = writeServerJSON(map[string]any{
+			"op": 0,
+			"s":  1,
+			"t":  "READY",
+			"d":  map[string]any{"session_id": "sess-slow"},
+		})
+		_ = writeServerJSON(map[string]any{
+			"op": 0,
+			"s":  2,
+			"t":  "C2C_MESSAGE_CREATE",
+			"d": map[string]any{
+				"id":        "msg-slow",
+				"content":   "/switch",
+				"timestamp": "2026-03-29T15:00:00Z",
+				"author":    map[string]any{"user_openid": "u-1"},
+			},
+		})
+
+		<-slowEntered
+
+		// While msg-slow is blocked in consume(), send a WS Ping control frame and a fast event!
+		_ = conn.WriteControl(websocket.PingMessage, []byte("modem-busy-ping"), time.Now().Add(time.Second))
+		_ = writeServerJSON(map[string]any{
+			"op": 0,
+			"s":  3,
+			"t":  "C2C_MESSAGE_CREATE",
+			"d": map[string]any{
+				"id":        "msg-fast",
+				"content":   "/status",
+				"timestamp": "2026-03-29T15:00:01Z",
+				"author":    map[string]any{"user_openid": "u-1"},
+			},
+		})
+
+		// Keep holding msg-slow for 150ms (> 2x 60ms readTimeout) to verify Heartbeat ACKs keep session alive!
+		time.Sleep(150 * time.Millisecond)
+		close(unblockSlow)
+		<-ctx.Done()
+	})
+
+	pump := New(Config{
+		Lookup:  staticLookup{url: wsURL},
+		Tokens:  staticTokens{token: "tok"},
+		Workers: 4,
+		Logger:  slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+	pump.readTimeout = func(hb time.Duration) time.Duration {
+		if hb <= 0 {
+			return 200 * time.Millisecond
+		}
+		return 2*hb + 30*time.Millisecond // 60ms
+	}
+
+	slowFinished := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- pump.Run(ctx, func(_ context.Context, env Envelope) error {
+			switch env.ID {
+			case "msg-slow":
+				close(slowEntered)
+				<-unblockSlow
+				close(slowFinished)
+			case "msg-fast":
+				close(fastDone)
+			}
+			return nil
+		})
+	}()
+
+	// Both WS Pong and msg-fast MUST complete BEFORE unblockSlow is closed!
+	select {
+	case pong := <-pongCh:
+		if pong != "modem-busy-ping" {
+			t.Fatalf("pong payload = %q, want modem-busy-ping", pong)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WS Ping was starved while slow consume was running")
+	}
+
+	select {
+	case <-fastDone:
+	case <-time.After(time.Second):
+		t.Fatal("fast message was starved by slow consume")
+	}
+
+	select {
+	case <-slowFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for slow consume to finish")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for Run() to drain workers and return")
+	}
+
+	if got := sessions.Load(); got != 1 {
+		t.Fatalf("sessions = %d, want 1 (session must not drop during slow consume)", got)
+	}
+}
+
+func TestPumpShortLivedSessionDoesNotResetBackoffUntilHealthy(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var clockMu sync.Mutex
+	curTime := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	advance := func(d time.Duration) {
+		clockMu.Lock()
+		curTime = curTime.Add(d)
+		clockMu.Unlock()
+	}
+
+	s4ReadySeen := make(chan struct{})
+	var sessions atomic.Int32
+	_, wsURL := newWSServer(t, func(conn *websocket.Conn) {
+		defer conn.Close()
+		sNum := sessions.Add(1)
+
+		_ = conn.WriteJSON(map[string]any{
+			"op": 10,
+			"d":  map[string]any{"heartbeat_interval": 1000},
+		})
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{
+			"op": 0,
+			"s":  1,
+			"t":  "READY",
+			"d":  map[string]any{"session_id": "sess-flap"},
+		})
+
+		switch sNum {
+		case 1, 2, 3:
+			// Session dies only 50ms after READY (< 30s healthyWindow) -> must NOT reset backoff!
+			advance(50 * time.Millisecond)
+			return
+		case 4:
+			// Ensure client has processed READY and recorded readyAt before advancing fake clock by 35s!
+			_ = conn.WriteJSON(map[string]any{
+				"op": 0,
+				"s":  2,
+				"t":  "C2C_MESSAGE_CREATE",
+				"d": map[string]any{
+					"id":        "s4-marker",
+					"content":   "ok",
+					"timestamp": "2026-03-29T15:00:00Z",
+					"author":    map[string]any{"user_openid": "u-1"},
+				},
+			})
+			<-s4ReadySeen
+			advance(35 * time.Second)
+			return
+		default:
+			cancel()
+			<-ctx.Done()
+		}
+	})
+
+	var waitMu sync.Mutex
+	var waits []time.Duration
+
+	pump := New(Config{
+		Lookup: staticLookup{url: wsURL},
+		Tokens: staticTokens{token: "tok"},
+		Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+	pump.now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return curTime
+	}
+	pump.wait = func(_ context.Context, d time.Duration) error {
+		waitMu.Lock()
+		waits = append(waits, d)
+		waitMu.Unlock()
+		return nil
+	}
+
+	if err := pump.Run(ctx, func(_ context.Context, env Envelope) error {
+		if env.ID == "s4-marker" {
+			close(s4ReadySeen)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	wantBase := []time.Duration{
+		1 * time.Second, // session 1 died at 50ms
+		2 * time.Second, // session 2 died at 50ms (backed off, NOT reset!)
+		4 * time.Second, // session 3 died at 50ms (backed off, NOT reset!)
+		1 * time.Second, // session 4 stayed healthy 35s -> reset to 1s!
+	}
+	if len(waits) != len(wantBase) {
+		t.Fatalf("waits = %v, want len %d", waits, len(wantBase))
+	}
+	for i, base := range wantBase {
+		minW := time.Duration(float64(base) * 0.8)
+		maxW := time.Duration(float64(base)*1.2) + time.Millisecond
+		if waits[i] < minW || waits[i] > maxW {
+			t.Fatalf("waits[%d] = %v, want in [%v, %v] (all=%v)", i, waits[i], minW, maxW, waits)
+		}
+	}
 }

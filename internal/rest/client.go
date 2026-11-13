@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,11 +19,23 @@ import (
 const (
 	maxResponseBytes = 1 << 20
 	maxDrainBytes    = 64 << 10
+	maxRetryShift    = 10
+	maxRetryWait     = 30 * time.Second
 )
 
 type TokenProvider interface {
 	Token(context.Context) (string, error)
+}
+
+type InvalidatableTokenProvider interface {
+	TokenProvider
 	Invalidate()
+}
+
+func invalidateToken(p TokenProvider) {
+	if inv, ok := p.(InvalidatableTokenProvider); ok {
+		inv.Invalidate()
+	}
 }
 
 type Config struct {
@@ -40,6 +54,9 @@ type Client struct {
 	retryCount  int
 	retryDelay  time.Duration
 	defaultKind string
+	now         func() time.Time
+	sleep       func(context.Context, time.Duration) error
+	jitter      func(time.Duration) time.Duration
 }
 
 type SendRequest struct {
@@ -63,9 +80,10 @@ type SendResult struct {
 
 type apiError struct {
 	StatusCode int
-	Code       int    `json:"code"`
-	Message    string `json:"message"`
-	TraceID    string
+	Code       int           `json:"code"`
+	Message    string        `json:"message"`
+	TraceID    string        `json:"-"`
+	RetryAfter time.Duration `json:"-"`
 }
 
 func (e *apiError) Error() string {
@@ -114,6 +132,86 @@ func New(cfg Config) *Client {
 	}
 }
 
+func (c *Client) effectiveNow() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *Client) effectiveSleep(ctx context.Context, d time.Duration) error {
+	if c.sleep != nil {
+		return c.sleep(ctx, d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *Client) effectiveJitter(d time.Duration) time.Duration {
+	if c.jitter != nil {
+		return c.jitter(d)
+	}
+	return jitterDuration(d)
+}
+
+func jitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	// ±20% uniform jitter in [0.8*d, 1.2*d]
+	factor := 0.8 + rand.Float64()*0.4
+	out := time.Duration(float64(d) * factor)
+	if out <= 0 {
+		return 1
+	}
+	return out
+}
+
+func (c *Client) retryWait(attempt int, apiErr *apiError) time.Duration {
+	if apiErr != nil && apiErr.StatusCode == http.StatusTooManyRequests && apiErr.RetryAfter > 0 {
+		if apiErr.RetryAfter > maxRetryWait {
+			return maxRetryWait
+		}
+		return apiErr.RetryAfter
+	}
+
+	shift := attempt
+	if shift < 0 {
+		shift = 0
+	} else if shift > maxRetryShift {
+		shift = maxRetryShift
+	}
+	mult := time.Duration(1 << shift)
+
+	delay := c.retryDelay
+	if delay <= 0 {
+		delay = 200 * time.Millisecond
+	}
+	if delay > maxRetryWait/mult {
+		delay = maxRetryWait
+	} else {
+		delay *= mult
+	}
+
+	delay = c.effectiveJitter(delay)
+	if delay > maxRetryWait {
+		delay = maxRetryWait
+	}
+	if apiErr != nil && apiErr.RetryAfter > delay {
+		if apiErr.RetryAfter > maxRetryWait {
+			return maxRetryWait
+		}
+		return apiErr.RetryAfter
+	}
+	return delay
+}
+
 func (c *Client) Gateway(ctx context.Context) (string, error) {
 	if c.tokens == nil {
 		return "", errors.New("tokens 不能为空")
@@ -141,11 +239,11 @@ func (c *Client) Gateway(ctx context.Context) (string, error) {
 			return "", err
 		}
 		if resp.StatusCode == http.StatusUnauthorized && authAttempt == 0 {
-			c.tokens.Invalidate()
+			invalidateToken(c.tokens)
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return "", parseAPIError(resp, body)
+			return "", parseAPIError(resp, body, c.effectiveNow())
 		}
 
 		reply := gatewayReply{}
@@ -175,12 +273,9 @@ func (c *Client) Send(ctx context.Context, req SendRequest) (SendResult, error) 
 			return SendResult{}, err
 		}
 
-		timer := time.NewTimer(c.retryDelay * time.Duration(1<<attempt))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return SendResult{}, ctx.Err()
-		case <-timer.C:
+		wait := c.retryWait(attempt, apiErr)
+		if err := c.effectiveSleep(ctx, wait); err != nil {
+			return SendResult{}, err
 		}
 	}
 	return SendResult{}, lastErr
@@ -219,11 +314,11 @@ func (c *Client) sendOnce(ctx context.Context, req SendRequest) (SendResult, err
 			return SendResult{}, err
 		}
 		if resp.StatusCode == http.StatusUnauthorized && authAttempt == 0 {
-			c.tokens.Invalidate()
+			invalidateToken(c.tokens)
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return SendResult{}, parseAPIError(resp, raw)
+			return SendResult{}, parseAPIError(resp, raw, c.effectiveNow())
 		}
 
 		reply := messageReply{}
@@ -247,15 +342,53 @@ func readAndCloseBody(body io.ReadCloser) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(body, maxResponseBytes))
 }
 
-func parseAPIError(resp *http.Response, raw []byte) *apiError {
+func parseAPIError(resp *http.Response, raw []byte, now time.Time) *apiError {
 	apiErr := &apiError{
 		StatusCode: resp.StatusCode,
 		TraceID:    resp.Header.Get("x-tps-trace-id"),
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), now),
 	}
 	if err := json.Unmarshal(raw, apiErr); err != nil && apiErr.Message == "" {
 		apiErr.Message = strings.TrimSpace(string(raw))
 	}
 	return apiErr
+}
+
+func parseRetryAfter(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		maxSecs := int64(maxRetryWait / time.Second)
+		if secs > maxSecs {
+			return maxRetryWait
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if secsFloat, err := strconv.ParseFloat(raw, 64); err == nil {
+		if secsFloat <= 0 || math.IsNaN(secsFloat) || math.IsInf(secsFloat, 0) {
+			return 0
+		}
+		if secsFloat >= maxRetryWait.Seconds() {
+			return maxRetryWait
+		}
+		return time.Duration(secsFloat * float64(time.Second))
+	}
+	if ts, err := http.ParseTime(raw); err == nil {
+		d := ts.Sub(now)
+		if d <= 0 {
+			return 0
+		}
+		if d > maxRetryWait {
+			return maxRetryWait
+		}
+		return d
+	}
+	return 0
 }
 
 func escapePathSegment(seg string) string {

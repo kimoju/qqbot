@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/kimoju/qqbot/internal/stream"
 )
@@ -87,24 +89,7 @@ func (e *Engine) Route(event stream.Envelope) (Route, bool) {
 	}
 
 	text := normalizeText(event)
-	if !strings.HasPrefix(text, e.prefix) {
-		return route, false
-	}
-
-	fields := strings.Fields(text)
-	if len(fields) == 0 {
-		return route, false
-	}
-
-	name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(fields[0], e.prefix)))
-	if name == "" {
-		return route, false
-	}
-	route.Command = &Command{
-		Name:     name,
-		Params:   append([]string(nil), fields[1:]...),
-		Original: text,
-	}
+	route.Command = parseCommand(text, e.prefix)
 	return route, false
 }
 
@@ -112,20 +97,57 @@ func (e *Engine) duplicate(kind string, id string) bool {
 	return e.store.Seen(kind, id, time.Now(), e.window)
 }
 
+func parseCommand(text string, prefix string) *Command {
+	if text == "" || !strings.HasPrefix(text, prefix) {
+		return nil
+	}
+	rest := strings.TrimPrefix(text, prefix)
+	if rest == "" {
+		return nil
+	}
+	firstRune, _ := utf8.DecodeRuneInString(rest)
+	if firstRune == utf8.RuneError || unicode.IsSpace(firstRune) || firstRune == '/' || strings.HasPrefix(rest, prefix) {
+		return nil
+	}
+
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return nil
+	}
+	name := strings.ToLower(strings.TrimSpace(fields[0]))
+	if name == "" {
+		return nil
+	}
+	return &Command{
+		Name:     name,
+		Params:   append([]string(nil), fields[1:]...),
+		Original: text,
+	}
+}
+
 func normalizeText(event stream.Envelope) string {
 	text := strings.TrimSpace(event.Text)
 	if event.Kind != "group_mention" {
 		return text
 	}
-	if strings.HasPrefix(text, "<@") {
-		if index := strings.Index(text, ">"); index >= 0 {
-			text = text[index+1:]
+	for text != "" {
+		if strings.HasPrefix(text, "<@") {
+			index := strings.IndexByte(text, '>')
+			if index < 0 {
+				break
+			}
+			text = strings.TrimSpace(text[index+1:])
+			continue
 		}
-	}
-	if strings.HasPrefix(text, "@") {
-		if index := strings.IndexAny(text, " \t\r\n"); index >= 0 {
-			text = text[index+1:]
+		if strings.HasPrefix(text, "@") {
+			index := strings.IndexFunc(text, unicode.IsSpace)
+			if index < 0 {
+				return ""
+			}
+			text = strings.TrimSpace(text[index:])
+			continue
 		}
+		break
 	}
-	return strings.TrimSpace(text)
+	return text
 }

@@ -374,3 +374,72 @@ func TestClientDrainsResponseBodyForKeepAliveReuse(t *testing.T) {
 		t.Fatalf("new TCP connections = %d, want 1 (keep-alive reused)", got)
 	}
 }
+
+type plainTokenOnly struct {
+	tok string
+}
+
+func (p plainTokenOnly) Token(context.Context) (string, error) {
+	return p.tok, nil
+}
+
+func TestClientSend429HonorsRetryAfterSecondsAndHTTPDateAndShiftOverflow(t *testing.T) {
+	t.Parallel()
+
+	fixedNow := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
+	var attemptNum atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch attemptNum.Add(1) {
+		case 1:
+			w.Header().Set("Retry-After", "4")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":42900,"message":"rate limited"}`))
+		case 2:
+			w.Header().Set("Retry-After", fixedNow.Add(7*time.Second).UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"code":42900,"message":"rate limited date"}`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"ok-after-429","timestamp":"2026-11-14T10:00:11Z"}`))
+		}
+	}))
+	defer server.Close()
+
+	var sleeps []time.Duration
+	client := New(Config{
+		BaseURL:    server.URL,
+		Client:     server.Client(),
+		Tokens:     plainTokenOnly{tok: "tok-plain"},
+		RetryCount: 3,
+		RetryDelay: 200 * time.Millisecond,
+	})
+	client.now = func() time.Time { return fixedNow }
+	client.sleep = func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		return nil
+	}
+
+	res, err := client.Send(context.Background(), SendRequest{
+		RecipientKind: "c2c",
+		RecipientID:   "user-1",
+		Content:       "hello",
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	if res.ID != "ok-after-429" {
+		t.Fatalf("res.ID = %q, want ok-after-429", res.ID)
+	}
+	if len(sleeps) != 2 || sleeps[0] != 4*time.Second || sleeps[1] != 7*time.Second {
+		t.Fatalf("sleeps = %v, want [4s 7s]", sleeps)
+	}
+
+	// Guard against 1 << attempt integer overflow for high attempt counts (e.g. 62, 63, 100).
+	for _, highAttempt := range []int{30, 62, 63, 64, 100} {
+		wait := client.retryWait(highAttempt, &apiError{StatusCode: http.StatusInternalServerError})
+		if wait <= 0 || wait > maxRetryWait {
+			t.Fatalf("retryWait(attempt=%d) = %v, want in (0, %v]", highAttempt, wait, maxRetryWait)
+		}
+	}
+}

@@ -27,7 +27,10 @@ type App struct {
 
 	mu       sync.RWMutex
 	stop     context.CancelFunc
+	runDone  chan struct{}
+	runID    uint64
 	running  bool
+	closed   bool
 	commands map[string]CommandHandler
 	onText   TextHandler
 }
@@ -134,14 +137,34 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return nil
+	}
 	if a.running {
 		a.mu.Unlock()
 		return errors.New("app 已启动")
 	}
+	a.runID++
+	currentID := a.runID
 	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	a.stop = cancel
+	a.runDone = done
 	a.running = true
 	a.mu.Unlock()
+
+	defer func() {
+		cancel()
+		a.mu.Lock()
+		if a.runID == currentID {
+			a.stop = nil
+			a.runDone = nil
+			a.running = false
+		}
+		a.mu.Unlock()
+		close(done)
+	}()
 
 	err := a.eventPump.Run(runCtx, func(ctx context.Context, event stream.Envelope) error {
 		routed, drop := a.engine.Route(event)
@@ -186,11 +209,6 @@ func (a *App) Run(ctx context.Context) error {
 		return handler(ctx, conv)
 	})
 
-	a.mu.Lock()
-	a.stop = nil
-	a.running = false
-	a.mu.Unlock()
-
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}
@@ -199,12 +217,16 @@ func (a *App) Run(ctx context.Context) error {
 
 func (a *App) Close() error {
 	a.mu.Lock()
+	a.closed = true
 	stop := a.stop
-	a.stop = nil
-	a.running = false
+	done := a.runDone
 	a.mu.Unlock()
+
 	if stop != nil {
 		stop()
+	}
+	if done != nil {
+		<-done
 	}
 	if a.ownHTTPClient && a.httpClient != nil {
 		a.httpClient.CloseIdleConnections()
